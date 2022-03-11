@@ -1,0 +1,226 @@
+---
+title: "175-HW5"
+author: "Nick R. Bachelder"
+date: "2/2/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, include = FALSE)
+library(MASS)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(lmtest)
+library(dse)
+library(UnitCircle)
+all_shots <- read.csv('/Users/nickbachelder/Buckets Model/all_shots') %>% dplyr::select(-X) %>% mutate(GAME_DATE = as.Date(GAME_DATE)) %>% filter(SHOT_MADE_FLAG == 1)
+```
+
+
+### import and clean data 
+```{r}
+first_game_date <- all_shots %>% group_by(PLAYER_ID) %>% summarise(first_game_date = min(GAME_DATE))
+all_shots_1 <- all_shots %>% merge(first_game_date, by = 'PLAYER_ID')
+all_shots_1 <- all_shots_1 %>% mutate(career_length = floor(as.numeric(GAME_DATE - first_game_date) / 7)) %>%
+  mutate(SHOT_ZONE_BASIC = case_when(SHOT_ZONE_BASIC == 'Right Corner 3' ~ 'Three',
+                                     SHOT_ZONE_BASIC == 'Left Corner 3' ~ 'Three',
+                                     SHOT_ZONE_BASIC == 'Above the Break 3' ~ 'Three',
+                                     SHOT_ZONE_BASIC == 'Backcourt' ~ 'Three',
+                                     TRUE ~ 'Two'), Points = ifelse(SHOT_ZONE_BASIC == 'Three', 3, 2)) 
+
+
+all_shots_1 <- all_shots_1
+```
+
+
+```{r}
+# Below get all players that have played at least 150 months and get their average PPG for each month
+all_player_games <- all_shots_1 %>% group_by(PLAYER_NAME , career_length, GAME_ID) %>% dplyr::summarise(Points = sum(Points)) %>% ungroup() %>% group_by(PLAYER_NAME , career_length) %>%
+  group_by(PLAYER_NAME , career_length) %>% dplyr::summarise(Points = mean(na.omit(Points))) %>% filter(PLAYER_NAME == 'Vince Carter')
+
+player_scoring_by_mon_train <- all_player_games %>% filter(career_length < 700 )
+player_scoring_by_mon_test <- all_player_games %>% filter(career_length > 700)
+
+## This is data
+y <- player_scoring_by_mon_train$Points 
+y_test <- player_scoring_by_mon_test$Points
+
+overall <- all_player_games$Points
+
+plot(1:length(y), y, type = 'l', ann=FALSE)
+title('Vince Carter Average PPGs By Week In NBA Career', xlab = 'Weeks in NBA Career', ylab = 'Average Points Per Game')
+```
+
+# Since we want heteroskedasticity, we can use a box cox transform lambda value to see if we need to apply a transformation. Since 1 is contained in the 95% confidence CI for lambda, we conclude that constant variance is already achieved.
+
+```{r}
+bcTransform <- boxcox(y ~ as.numeric(1:length(y)))
+
+lam <- bcTransform$x[which(bcTransform$y == max(bcTransform$y))]
+
+y_t = y ## no box cox needed since 1 is in confidence interval
+```
+
+
+
+# We can also look at the histogram of the differenced data to ensure that our data looks approximately symettric with constant variance.
+
+```{r}
+plot.ts(y_t)
+var(y_t)
+```
+
+# Clearly not stationary. Difference once at lag 1.
+
+```{r}
+y_d_t <- diff(y_t, 1)
+print(var(na.omit(y_d_t)))
+
+y_dd_t <- diff(y_d_t, 1)
+print(var(na.omit(y_dd_t)))
+```
+
+```{r}
+plot.ts(y_d_t)
+```
+
+```{r}
+acf(y_d_t, lag.max=19)
+pacf(y_d_t, lag.max=19)
+```
+
+
+
+# From the above two acf and pacf plots, we can see that there is significant acf values at lag 1, as well as significant pacf values at lags 7 and 9.We run possible models below
+
+Below we try these and select the lowest AICc values.
+
+```{r}
+run_possible_mods <- function(ar_list, ma_list, s_list, maSlist) {
+  lowest_aic <- 1000000000000000
+  for (s in s_list) {
+    for (maS in maSlist) {
+      for (ar in ar_list) {
+        for (ma in ma_list){
+          mod <- arima(x = y_t, order = c(ar, 1, ma), seasonal = list(order = c(0,0, maS), period = s_list), method = "ML")
+          mod_res <- mod$residuals
+          shap <- (shapiro.test(mod_res)$p.value > 0.05)
+          bp <- (Box.test(mod_res, lag = 14, type = c("Box-Pierce"), fitdf = ma+ar+maS)$p.value > 0.05)
+          lb1 <- (Box.test(mod_res, lag = 14, type = c("Ljung-Box"), fitdf = ma+ar+maS)$p.value > 0.05)
+          lb2 <- (Box.test((mod_res)^2, lag = 14, type = c("Ljung-Box"), fitdf = 0)$p.value > 0.05)
+          if (shap & bp & lb1 & lb2){
+            print(paste('AR=', ar, ' MA=', ma,  'S=', s, 'MAS=', maS, ' AICc=', round(mod$aic, 1), '....... Passes all tests'))
+            if (round(mod$aic, 1) < lowest_aic) {
+              best_model <- paste('AR=',ar, 'MA=', ma, 'S=', s, 'MAS=', maS)
+              lowest_aic <- mod$aic
+            }
+          }
+          else {
+            print(paste('AR=', ar, ' MA=', ma, 'S=', s, 'MAS=', maS, 'AICc=', round(mod$aic, 1), '.......   Fails at least one test'))
+          }
+        }
+      }
+      }
+  }
+  return(paste('DONE: Best model is' , best_model, 'with AIC', lowest_aic))
+}
+
+run_possible_mods(ar_list = c(0, 7, 9), ma_list = c(1), s_list = c(0), maSlist = c(0))
+```
+
+Need to complete diagnostic checking for best models.  Below are diagnostic plots for the residual of these models.
+
+```{r}
+Mod_1 <- arima(x = y_t, order = c(0, 1, 1), method = "ML")
+summary(Mod_1)
+
+Mod_1_res <- Mod_1$residuals
+
+plot.ts(Mod_1_res)
+qqnorm(Mod_1_res)
+hist(Mod_1_res)
+```
+```{r}
+acf(Mod_1_res, lag.max = 19)
+pacf(Mod_1_res, lag.max = 19)
+```
+
+
+
+```{r}
+hist(Mod_1_res)
+shapiro.test(Mod_1_res)
+Box.test(Mod_1_res, lag = 14, type = c("Box-Pierce"), fitdf = 1)
+Box.test(Mod_1_res, lag = 14, type = c("Ljung-Box"), fitdf = 1)
+Box.test((Mod_1_res)^2, lag = 14, type = c("Ljung-Box"), fitdf = 0)
+```
+```{r}
+Mod_2 <- arima(x = y_t, order = c(9, 1, 1), method = "ML")
+summary(Mod_2)
+
+Mod_2_res <- Mod_2$residuals
+
+plot.ts(Mod_2_res)
+qqnorm(Mod_2_res)
+hist(Mod_2_res)
+
+uc.check(pol_ = c(1,-0.1650,-0.0965,-0.1392,-0.0332,-0.0742,-0.1555,-0.2211,-0.0392,-0.2083), plot_output = T)
+```
+
+```{r}
+acf(Mod_2_res, lag.max = 19)
+pacf(Mod_2_res, lag.max = 19)
+```
+
+
+
+```{r}
+hist(Mod_2_res)
+shapiro.test(Mod_2_res)
+Box.test(Mod_2_res, lag = 14, type = c("Box-Pierce"), fitdf = 1)
+Box.test(Mod_2_res, lag = 14, type = c("Ljung-Box"), fitdf = 1)
+Box.test((Mod_2_res)^2, lag = 14, type = c("Ljung-Box"), fitdf = 0)
+```
+
+
+
+```{r}
+Mod_3 <- arima(x = y_t, order = c(7, 1, 1), method = "ML")
+summary(Mod_3)
+
+Mod_3_res <- Mod_3$residuals
+
+plot.ts(Mod_3_res)
+qqnorm(Mod_3_res)
+hist(Mod_3_res)
+
+uc.check(pol_ = c(1,-0.0207,0.0631, -0.0305, 0.0530, -0.0274, -0.0956, -0.1761), plot_output = T)
+```
+```{r}
+hist(Mod_3_res)
+shapiro.test(Mod_3_res)
+Box.test(Mod_3_res, lag = 14, type = c("Box-Pierce"), fitdf = 6)
+Box.test(Mod_3_res, lag = 14, type = c("Ljung-Box"), fitdf = 6)
+Box.test((Mod_3_res)^2, lag = 14, type = c("Ljung-Box"), fitdf = 0)
+```
+
+```{r}
+acf(Mod_3_res, lag.max = 19)
+pacf(Mod_3_res, lag.max = 19)
+```
+
+
+
+## predict data using best model. Select model C even though higher AIC, as it is the best stationary and invertible model taht passes all diagnositic tests / has good ACF PACF plots.
+
+```{r}
+pred.tr <- predict(Mod_3, n.ahead = 135)
+U.tr= pred.tr$pred + 1.96*pred.tr$se
+L.tr= pred.tr$pred - 1.96*pred.tr$se
+ts.plot(y_t, xlim=c(1,length(y_t)+12), ylim = c(min(L.tr), 30))
+lines(U.tr, col="blue", lty="dashed")
+lines(L.tr, col="blue", lty="dashed")
+points((length(y_t)+1):(length(y_t)+135), pred.tr$pred, col="red")
+points((length(y_t)+1):(length(y_t)+135), y_test, col="black")
+```
